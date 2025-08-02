@@ -1,7 +1,10 @@
 use cgmath::{Matrix4, Vector2};
 use cgmath::{SquareMatrix, Vector3};
+use crossbeam::{channel, thread};
 use gl::types::*;
 use std::ffi::c_void;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::{mem, ptr};
 
 //local
@@ -12,6 +15,7 @@ use crate::common::make_texture_array;
 const CHUNKSIZE: usize = 16;
 const CHUNKHIEGHT: usize = 128;
 const RENDERDISTANCE: usize = 128;
+const THREADS: usize = 12;
 const vertices: [f32; 120] = [
     // back  (‑Z)
     -0.5, -0.5, -0.5, 0.0, 0.0, // 0
@@ -54,6 +58,11 @@ const DIRS: [[i16; 3]; 6] = [
     [0, 1, 0],  //up
 ];
 
+struct Job {
+    cx: usize,
+    cz: usize,
+}
+
 pub struct World<'a> {
     chunks: [[Chunk<'a>; RENDERDISTANCE]; RENDERDISTANCE],
 }
@@ -79,35 +88,59 @@ impl<'a> World<'a> {
         Self { chunks }
     }
 
-    pub fn setAll(&mut self) {
-        for i in 0..self.chunks.len() {
-            for chunk in &mut self.chunks[i] {
-                for x in 0..16 {
-                    for y in 0..CHUNKHIEGHT {
-                        for z in 0..16 {
-                            if x == 15 {
-                                chunk.set(Vector3 { x, y, z }, BlockId::Grass);
-                            }  else {
-                                chunk.set(Vector3 { x, y, z }, BlockId::Dirt);
-                            }
-                            if z == 8 && y >= 122 {
-                                chunk.set(Vector3 { x, y, z }, BlockId::Air);
-                            }
-                            // if y >= 120 {
-                            //     let r = rand::random_range(0..3);
-                            //     if r == 0 {
-                            //         chunk.set(Vector3 { x, y, z }, BlockId::Grass);
-                            //     } else {
-                            //         chunk.set(Vector3 { x, y, z }, BlockId::Air);
-                            //     }
-                            // } else {
-                            //     chunk.set(Vector3 { x, y, z }, BlockId::Dirt);
-                            // }
-                        }
+    fn fillChunk(chunk: &mut Chunk) {
+        for x in 0..16 {
+            for y in 0..CHUNKHIEGHT {
+                for z in 0..16 {
+                    if x == 15 {
+                        chunk.set(Vector3 { x, y, z }, BlockId::Grass);
+                    } else {
+                        chunk.set(Vector3 { x, y, z }, BlockId::Dirt);
                     }
+                    if z == 8 && y >= 122 {
+                        chunk.set(Vector3 { x, y, z }, BlockId::Air);
+                    }
+                    // if y >= 120 {
+                    //     let r = rand::random_range(0..3);
+                    //     if r == 0 {
+                    //         chunk.set(Vector3 { x, y, z }, BlockId::Grass);
+                    //     } else {
+                    //         chunk.set(Vector3 { x, y, z }, BlockId::Air);
+                    //     }
+                    // } else {
+                    //     chunk.set(Vector3 { x, y, z }, BlockId::Dirt);
+                    // }
                 }
             }
         }
+    }
+
+    pub fn setAll(&mut self) {
+        let (tx, rx) = channel::unbounded::<Job>();
+
+        for cx in 0..RENDERDISTANCE {
+            for cz in 0..RENDERDISTANCE {
+                tx.send(Job { cx, cz }).unwrap();
+            }
+        }
+        drop(tx);
+
+        let chunks = Arc::new(Mutex::new(&mut self.chunks));
+
+        thread::scope(|s| {
+            for _ in 0..THREADS {
+                let rx = rx.clone();
+                let chunks_clone = Arc::clone(&chunks);
+                s.spawn(move |_| {
+                    while let Ok(job) = rx.recv() {
+                        let mut chunks = chunks_clone.lock().unwrap();
+                        let chunk = &mut chunks[job.cx][job.cz];
+                        World::fillChunk(chunk);
+                    }
+                });
+            }
+        })
+        .unwrap();
     }
 
     pub fn chunkRemeshAll(&mut self) {
@@ -215,7 +248,7 @@ impl<'a> Chunk<'a> {
             VBO,
             EBO,
             texture,
-            verts: Vec::with_capacity(CHUNKSIZE*CHUNKSIZE*CHUNKHIEGHT*4*6),
+            verts: Vec::with_capacity(CHUNKSIZE * CHUNKSIZE * CHUNKHIEGHT * 4 * 6),
             vertexCount: 0,
             indexCount: 0,
             pos,

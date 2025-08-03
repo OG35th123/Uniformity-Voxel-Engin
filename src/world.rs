@@ -14,8 +14,8 @@ use crate::common::make_texture_array;
 //settings
 const CHUNKSIZE: usize = 16;
 const CHUNKHIEGHT: usize = 128;
-const RENDERDISTANCE: usize = 128;
-const THREADS: usize = 12;
+const RENDERDISTANCE: usize = 32;
+const THREADS: usize = 8;
 const vertices: [f32; 120] = [
     // back  (‑Z)
     -0.5, -0.5, -0.5, 0.0, 0.0, // 0
@@ -144,13 +144,43 @@ impl<'a> World<'a> {
     }
 
     pub fn chunkRemeshAll(&mut self) {
-        let world_ptr: *const World = self; // raw const pointer → no borrow clash
-        for row in self.chunks.iter_mut() {
-            for chunk in row {
-                unsafe {
-                    chunk.remesh(&*world_ptr);
-                }
+        let mut jobs = Vec::<(usize, usize)>::new();
+        for (z, row) in self.chunks.iter().enumerate() {
+            for (x, _) in row.iter().enumerate() {
+                jobs.push((z, x));
             }
+        }
+
+        let (job_tx, job_rx) = channel::unbounded::<(usize, usize)>();
+        let (res_tx, res_rx) = channel::unbounded::<((usize, usize), MeshData)>();
+
+        for j in &jobs {
+            job_tx.send(*j).unwrap();
+        }
+        drop(job_tx);         
+
+        thread::scope(|s| {
+            let world_ref = &*self; // shared read-only borrow
+
+            for _ in 0..THREADS {
+                let job_rx = job_rx.clone();
+                let res_tx = res_tx.clone();
+
+                s.spawn(move |_| {
+                    while let Ok((z, x)) = job_rx.recv() {
+                        let chunk = &world_ref.chunks[z][x]; // &Chunk
+                        let mesh = chunk.remesh(world_ref); // read-only
+                        res_tx.send(((z, x), mesh)).unwrap();
+                    }
+                });
+            }
+        })
+        .unwrap(); // all workers have joined here
+
+        // -------- Main thread: GPU upload & state updates --------
+        while let Ok(((z, x), mesh)) = res_rx.try_recv() {
+            let chunk = &mut self.chunks[z][x]; // &mut borrow *after* scope
+            chunk.uploadMesh(mesh);
         }
     }
 
@@ -161,6 +191,7 @@ impl<'a> World<'a> {
             }
         }
     }
+
     pub fn getBlockType(&self, pos: Vector2<i32>, blockPos: Vector3<usize>) -> BlockId {
         let x = pos.x;
         let z = pos.y;
@@ -181,6 +212,11 @@ impl<'a> World<'a> {
     }
 }
 
+pub struct MeshData {
+    pub vertices: Vec<f32>,
+    pub indices: Vec<u32>,
+}
+
 #[repr(u8)]
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum BlockId {
@@ -196,8 +232,8 @@ pub struct Chunk<'a> {
     VBO: u32,
     EBO: u32,
     texture: u32,
-    verts: Vec<f32>,
-    vertexCount: i32,
+    // verts: Vec<f32>,
+    // vertexCount: i32,
     indexCount: i32,
     pos: Vector2<i32>,
 }
@@ -248,8 +284,8 @@ impl<'a> Chunk<'a> {
             VBO,
             EBO,
             texture,
-            verts: Vec::with_capacity(CHUNKSIZE * CHUNKSIZE * CHUNKHIEGHT * 4 * 6),
-            vertexCount: 0,
+            // verts: Vec::with_capacity(CHUNKSIZE * CHUNKSIZE * CHUNKHIEGHT * 4 * 6),
+            // vertexCount: 0,
             indexCount: 0,
             pos,
         }
@@ -259,8 +295,8 @@ impl<'a> Chunk<'a> {
         self.blocks[cord.x][cord.y][cord.z] = block;
     }
 
-    pub fn remesh(&mut self, world: &World) {
-        self.verts.clear();
+    pub fn remesh(&self, world: &World) -> MeshData {
+        let mut verts: Vec<f32> = Vec::with_capacity(CHUNKSIZE * CHUNKSIZE * CHUNKHIEGHT * 6);
         let mut inds: Vec<u32> = Vec::new();
         let mut next = 0u32;
 
@@ -339,7 +375,7 @@ impl<'a> Chunk<'a> {
                                     face[indx] += 1. * z as f32;
                                 }
                             }
-                            self.verts.extend(face.iter().clone());
+                            verts.extend(face.iter().clone());
                             let indsSlice = &[next, next + 1, next + 2, next, next + 2, next + 3];
                             inds.extend_from_slice(indsSlice);
                             next += 4;
@@ -349,30 +385,39 @@ impl<'a> Chunk<'a> {
             }
         }
 
-        self.verts.shrink_to_fit();
-        self.vertexCount = self.verts.len() as i32;
-        self.indexCount = inds.len() as i32;
+        verts.shrink_to_fit();
+        // self.vertexCount = self.verts.len() as i32;
+        // self.indexCount = inds.len() as i32;
 
+        MeshData {
+            vertices: verts,
+            indices: inds,
+        }
+    }
+
+    pub fn uploadMesh(&mut self, data: MeshData) {
+        self.indexCount = data.indices.len() as i32;
         unsafe {
             gl::BindVertexArray(self.VAO);
 
             gl::BindBuffer(gl::ARRAY_BUFFER, self.VBO);
             gl::BufferData(
                 gl::ARRAY_BUFFER,
-                (self.verts.len() * mem::size_of::<GLfloat>()) as GLsizeiptr,
-                &self.verts[0] as *const f32 as *const c_void,
+                (data.vertices.len() * mem::size_of::<GLfloat>()) as GLsizeiptr,
+                &data.vertices[0] as *const f32 as *const c_void,
                 gl::STATIC_DRAW,
             );
 
             gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, self.EBO);
             gl::BufferData(
                 gl::ELEMENT_ARRAY_BUFFER,
-                (inds.len() * mem::size_of::<GLfloat>()) as GLsizeiptr,
-                &inds[0] as *const u32 as *const c_void,
+                (data.indices.len() * mem::size_of::<GLfloat>()) as GLsizeiptr,
+                &data.indices[0] as *const u32 as *const c_void,
                 gl::STATIC_DRAW,
             );
         }
     }
+
     pub fn draw(&self, proj: &Matrix4<f32>, view: &Matrix4<f32>) {
         unsafe {
             self.shader.useProgram();

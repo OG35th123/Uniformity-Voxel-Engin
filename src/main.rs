@@ -1,12 +1,11 @@
 #![allow(non_upper_case_globals)]
 #![allow(non_snake_case)]
 extern crate glfw;
-use crate::world::World;
 
-use self::glfw::{Context};
+use self::glfw::Context;
 extern crate gl;
-use cgmath::{perspective, Deg, Point3, Vector2, Vector3};
 use cgmath::Matrix4;
+use cgmath::{Deg, Point3, Vector2, Vector3, perspective};
 use std::sync::Arc;
 
 // Local
@@ -14,25 +13,22 @@ mod shader;
 use glfw::fail_on_errors;
 use shader::Shader;
 mod common;
-use common::{processInput, process_events};
+use common::{process_events, processInput};
 mod camera;
 use camera::Camera;
 mod world;
-use world::{Chunk, BlockId};
-
+use crate::world::World;
 
 // settings
 const SCR_WIDTH: u32 = 800;
 const SCR_HEIGHT: u32 = 600;
 
-
 #[allow(non_snake_case)]
 pub fn main() {
     let mut camera = Camera {
-        Position: Point3::new(0.0, 0.0, 3.0),
+        Position: Point3::new(0.0, 0.0, 0.0),
         ..Camera::default()
     };
-
 
     let mut firstMouse = true;
     let mut lastX: f32 = SCR_WIDTH as f32 / 2.0;
@@ -84,11 +80,9 @@ pub fn main() {
 
     let chunkShader = Shader::new("src/shaders/shaderAtlas.vs", "src/shaders/shaderAtlas.fs");
 
-        
     let mut world = World::new(&chunkShader);
     world.setAll();
     world.chunkRemeshAll();
-
 
     // let mut chunk = Chunk::new(&chunkShader, Vector2 { x: 0.0, y: 0.0 });
 
@@ -137,9 +131,23 @@ pub fn main() {
             gl::ClearColor(0.2, 0.3, 0.3, 1.0);
             gl::Clear(gl::COLOR_BUFFER_BIT | gl::DEPTH_BUFFER_BIT);
 
-            let projection: Matrix4<f32> =
-                perspective(Deg(45.0), SCR_WIDTH as f32 / SCR_HEIGHT as f32, 0.1, 16.0*16.0);
+            let projection: Matrix4<f32> = perspective(
+                Deg(45.0),
+                SCR_WIDTH as f32 / SCR_HEIGHT as f32,
+                0.1,
+                16.0 * 16.0,
+            );
             let view = camera.GetViewMatrix();
+
+            // let pos = camera.Position;
+
+            // println!("world position: {:?}, local position: {:?}", pos, World::worldToLoc(pos));
+
+            // println!("{:?}", pos);
+
+            // let front = camera.Front;
+            //
+            // println!("{:?}", front);
 
             world.renderAll(&projection, &view);
             // chunk.draw(&projection, &view);
@@ -151,4 +159,3 @@ pub fn main() {
         glfw.poll_events();
     }
 }
-

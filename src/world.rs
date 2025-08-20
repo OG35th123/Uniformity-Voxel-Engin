@@ -1,8 +1,10 @@
-use cgmath::{Matrix4, Vector2};
+use cgmath::{Matrix4, Point1, Point2, Point3, Vector2};
 use cgmath::{SquareMatrix, Vector3};
 use crossbeam::{channel, thread};
 use gl::types::*;
+use std::collections::HashMap;
 use std::ffi::c_void;
+use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::{mem, ptr};
@@ -14,7 +16,7 @@ use crate::common::make_texture_array;
 //settings
 const CHUNKSIZE: usize = 16;
 const CHUNKHIEGHT: usize = 128;
-const RENDERDISTANCE: usize = 32;
+const RENDERDISTANCE: usize = 6;
 const THREADS: usize = 8;
 const vertices: [f32; 120] = [
     // back  (‑Z)
@@ -58,13 +60,14 @@ const DIRS: [[i16; 3]; 6] = [
     [0, 1, 0],  //up
 ];
 
-struct Job {
-    cx: usize,
-    cz: usize,
+#[derive(Hash, Eq, PartialEq, Debug, Clone, Copy)]
+pub struct ChunkPos {
+    x: i32,
+    z: i32,
 }
 
 pub struct World<'a> {
-    chunks: [[Chunk<'a>; RENDERDISTANCE]; RENDERDISTANCE],
+    chunks: HashMap<ChunkPos, Chunk<'a>>,
 }
 
 impl<'a> World<'a> {
@@ -73,18 +76,16 @@ impl<'a> World<'a> {
             &["src/textures/txDirt.png", "src/textures/txGrass.png"],
             shader,
         );
-        let chunks: [[Chunk; RENDERDISTANCE]; RENDERDISTANCE] = std::array::from_fn(|x| {
-            std::array::from_fn(|z| {
-                Chunk::new(
-                    shader,
-                    Vector2 {
-                        x: x as i32,
-                        y: z as i32,
-                    },
-                    texture,
-                )
-            })
-        });
+        let mut chunks = HashMap::new();
+        for x in 0..RENDERDISTANCE as i32 {
+            for z in 0..RENDERDISTANCE as i32 {
+                let pos = ChunkPos {x: x - RENDERDISTANCE as i32 / 2, z: z - RENDERDISTANCE as i32 / 2 };
+                chunks.insert(
+                    pos,
+                    Chunk::new(shader, pos, texture),
+                );
+            }
+        }
         Self { chunks }
     }
 
@@ -92,36 +93,21 @@ impl<'a> World<'a> {
         for x in 0..16 {
             for y in 0..CHUNKHIEGHT {
                 for z in 0..16 {
-                    if x == 15 {
+                    if y >= 120 {
                         chunk.set(Vector3 { x, y, z }, BlockId::Grass);
                     } else {
                         chunk.set(Vector3 { x, y, z }, BlockId::Dirt);
                     }
-                    if z == 8 && y >= 122 {
-                        chunk.set(Vector3 { x, y, z }, BlockId::Air);
-                    }
-                    // if y >= 120 {
-                    //     let r = rand::random_range(0..3);
-                    //     if r == 0 {
-                    //         chunk.set(Vector3 { x, y, z }, BlockId::Grass);
-                    //     } else {
-                    //         chunk.set(Vector3 { x, y, z }, BlockId::Air);
-                    //     }
-                    // } else {
-                    //     chunk.set(Vector3 { x, y, z }, BlockId::Dirt);
-                    // }
                 }
             }
         }
     }
 
     pub fn setAll(&mut self) {
-        let (tx, rx) = channel::unbounded::<Job>();
+        let (tx, rx) = channel::unbounded::<ChunkPos>();
 
-        for cx in 0..RENDERDISTANCE {
-            for cz in 0..RENDERDISTANCE {
-                tx.send(Job { cx, cz }).unwrap();
-            }
+        for key in self.chunks.keys().copied() {
+            tx.send(key);
         }
         drop(tx);
 
@@ -134,7 +120,7 @@ impl<'a> World<'a> {
                 s.spawn(move |_| {
                     while let Ok(job) = rx.recv() {
                         let mut chunks = chunks_clone.lock().unwrap();
-                        let chunk = &mut chunks[job.cx][job.cz];
+                        let chunk = chunks.get_mut(&job).expect("setAll(): failed to get chunk");
                         World::fillChunk(chunk);
                     }
                 });
@@ -144,20 +130,18 @@ impl<'a> World<'a> {
     }
 
     pub fn chunkRemeshAll(&mut self) {
-        let mut jobs = Vec::<(usize, usize)>::new();
-        for (z, row) in self.chunks.iter().enumerate() {
-            for (x, _) in row.iter().enumerate() {
-                jobs.push((z, x));
-            }
+        let mut jobs = Vec::<ChunkPos>::new();
+        for key in self.chunks.keys().copied() {
+            jobs.push(key);
         }
 
-        let (job_tx, job_rx) = channel::unbounded::<(usize, usize)>();
-        let (res_tx, res_rx) = channel::unbounded::<((usize, usize), MeshData)>();
+        let (job_tx, job_rx) = channel::unbounded::<ChunkPos>();
+        let (res_tx, res_rx) = channel::unbounded::<(ChunkPos, MeshData)>();
 
         for j in &jobs {
             job_tx.send(*j).unwrap();
         }
-        drop(job_tx);         
+        drop(job_tx);
 
         thread::scope(|s| {
             let world_ref = &*self; // shared read-only borrow
@@ -167,10 +151,13 @@ impl<'a> World<'a> {
                 let res_tx = res_tx.clone();
 
                 s.spawn(move |_| {
-                    while let Ok((z, x)) = job_rx.recv() {
-                        let chunk = &world_ref.chunks[z][x]; // &Chunk
+                    while let Ok(pos) = job_rx.recv() {
+                        let chunk = &world_ref
+                            .chunks
+                            .get(&pos)
+                            .expect("chunkRemeshAll(): couldnt find chunk"); // &Chunk
                         let mesh = chunk.remesh(world_ref); // read-only
-                        res_tx.send(((z, x), mesh)).unwrap();
+                        res_tx.send((pos, mesh)).unwrap();
                     }
                 });
             }
@@ -178,37 +165,40 @@ impl<'a> World<'a> {
         .unwrap(); // all workers have joined here
 
         // -------- Main thread: GPU upload & state updates --------
-        while let Ok(((z, x), mesh)) = res_rx.try_recv() {
-            let chunk = &mut self.chunks[z][x]; // &mut borrow *after* scope
+        while let Ok((pos, mesh)) = res_rx.try_recv() {
+            let chunk = &mut self
+                .chunks
+                .get_mut(&pos)
+                .expect("chunkRemeshAll(): couldnt find chunk"); // &mut borrow *after* scope
             chunk.uploadMesh(mesh);
         }
     }
 
     pub fn renderAll(&self, proj: &Matrix4<f32>, view: &Matrix4<f32>) {
-        for i in 0..self.chunks.len() {
-            for chunk in &self.chunks[i] {
-                chunk.draw(proj, view);
-            }
+        for chunk in self.chunks.values() {
+            chunk.draw(proj, view);
         }
     }
+    //
+    // pub fn worldToLoc(pos: Point3<f32>) -> (Point3<i32>, Point2<i32>) {
+    //     let (wx, wy, wz) = (
+    //         pos.x.floor() as i32,
+    //         pos.y.floor() as i32,
+    //         pos.z.floor() as i32,
+    //     );
+    //     let (cx, cz) = (wx / CHUNKSIZE as i32, wz / CHUNKSIZE as i32);
+    //     // let (bx, by, bz) = (wx - CHUNKSIZE as i32 * cx, wy, wz - CHUNKSIZE as i32 * cz);
+    //     let bx = wx + CHUNKSIZE as i32;
+    //
+    //     (Point3::new(wz, wy, wx), Point2::new(cz, cx))
+    // }
 
-    pub fn getBlockType(&self, pos: Vector2<i32>, blockPos: Vector3<usize>) -> BlockId {
-        let x = pos.x;
-        let z = pos.y;
-        let mut blockPosX = blockPos.x;
-        let mut blockPosZ = blockPos.z;
-
-        if x < 0 || x >= RENDERDISTANCE as i32 || z < 0 || z >= RENDERDISTANCE as i32 {
-            return BlockId::Air; // outside loaded world → treat as air
+    pub fn getBlockType(&self, pos: ChunkPos, blockPos: Point3<usize>) -> BlockId {
+        match self.chunks.get(&pos) {
+            Some(chunk) => {chunk.blocks[blockPos.x][blockPos.y][blockPos.z]},
+            None => {BlockId::Air}
         }
 
-        if blockPosX == CHUNKSIZE {
-            blockPosX = CHUNKSIZE - 1;
-        }
-        if blockPosZ == CHUNKSIZE {
-            blockPosZ = CHUNKSIZE - 1;
-        }
-        self.chunks[x as usize][z as usize].blocks[blockPosX][blockPos.y][blockPosZ]
     }
 }
 
@@ -235,11 +225,11 @@ pub struct Chunk<'a> {
     // verts: Vec<f32>,
     // vertexCount: i32,
     indexCount: i32,
-    pos: Vector2<i32>,
+    pos: ChunkPos,
 }
 
 impl<'a> Chunk<'a> {
-    pub fn new(shader: &'a Shader, pos: Vector2<i32>, texture: u32) -> Self {
+    pub fn new(shader: &'a Shader, pos: ChunkPos, texture: u32) -> Self {
         let (mut VBO, mut VAO, mut EBO) = (0, 0, 0);
 
         unsafe {
@@ -321,7 +311,7 @@ impl<'a> Chunk<'a> {
                         if !isEnd {
                             // Work out which chunk (cx, cz) we should peek into
                             let mut cx = self.pos.x; // current chunk-coords (i32)
-                            let mut cz = self.pos.y;
+                            let mut cz = self.pos.z;
 
                             if dx < 0 {
                                 cx -= 1; // step West
@@ -341,8 +331,8 @@ impl<'a> Chunk<'a> {
 
                             // Look up the block in whatever chunk we ended up in
                             if world.getBlockType(
-                                Vector2 { x: cx, y: cz },
-                                Vector3 {
+                                ChunkPos { x: cx, z: cz },
+                                Point3 {
                                     x: dx as usize,
                                     y: dy as usize,
                                     z: dz as usize,
@@ -425,9 +415,9 @@ impl<'a> Chunk<'a> {
             self.shader.setMat4(c"view", view);
 
             let model = cgmath::Matrix4::<f32>::from_translation(Vector3 {
-                x: (self.pos.x as f32 - (RENDERDISTANCE as f32 / 2.0)) * 16.0,
+                x: self.pos.x as f32 * 16.0 + 0.5,
                 y: 0.0,
-                z: (self.pos.y as f32 - (RENDERDISTANCE as f32 / 2.0)) * 16.0,
+                z: self.pos.z as f32 * 16.0 + 0.5,
             });
             self.shader.setMat4(c"model", &model);
 

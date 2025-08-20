@@ -25,7 +25,7 @@ use self::Camera_Movement::*;
 // Default camera values
 const YAW: f32 = -90.0;
 const PITCH: f32 = 0.0;
-const SPEED: f32 = 10.0;
+const SPEED: f32 = 5.5;
 const SENSITIVTY: f32 = 0.1;
 const ZOOM: f32 = 45.0;
 

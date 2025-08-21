@@ -139,9 +139,9 @@ pub fn main() {
             );
             let view = camera.GetViewMatrix();
 
-            // let pos = camera.Position;
+            let pos = camera.Position;
 
-            // println!("world position: {:?}, local position: {:?}", pos, World::worldToLoc(pos));
+            println!("world position: {:?}, local position: {:?}", pos, World::worldToLoc(pos));
 
             // println!("{:?}", pos);
 

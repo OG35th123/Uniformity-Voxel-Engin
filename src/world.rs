@@ -16,7 +16,7 @@ use crate::common::make_texture_array;
 //settings
 const CHUNKSIZE: usize = 16;
 const CHUNKHIEGHT: usize = 128;
-const RENDERDISTANCE: usize = 6;
+const RENDERDISTANCE: usize = 3;
 const THREADS: usize = 8;
 const vertices: [f32; 120] = [
     // back  (‑Z)
@@ -79,11 +79,11 @@ impl<'a> World<'a> {
         let mut chunks = HashMap::new();
         for x in 0..RENDERDISTANCE as i32 {
             for z in 0..RENDERDISTANCE as i32 {
-                let pos = ChunkPos {x: x - RENDERDISTANCE as i32 / 2, z: z - RENDERDISTANCE as i32 / 2 };
-                chunks.insert(
-                    pos,
-                    Chunk::new(shader, pos, texture),
-                );
+                let pos = ChunkPos {
+                    x: x - RENDERDISTANCE as i32 / 2,
+                    z: z - RENDERDISTANCE as i32 / 2,
+                };
+                chunks.insert(pos, Chunk::new(shader, pos, texture));
             }
         }
         Self { chunks }
@@ -179,26 +179,31 @@ impl<'a> World<'a> {
             chunk.draw(proj, view);
         }
     }
-    //
-    // pub fn worldToLoc(pos: Point3<f32>) -> (Point3<i32>, Point2<i32>) {
-    //     let (wx, wy, wz) = (
-    //         pos.x.floor() as i32,
-    //         pos.y.floor() as i32,
-    //         pos.z.floor() as i32,
-    //     );
-    //     let (cx, cz) = (wx / CHUNKSIZE as i32, wz / CHUNKSIZE as i32);
-    //     // let (bx, by, bz) = (wx - CHUNKSIZE as i32 * cx, wy, wz - CHUNKSIZE as i32 * cz);
-    //     let bx = wx + CHUNKSIZE as i32;
-    //
-    //     (Point3::new(wz, wy, wx), Point2::new(cz, cx))
-    // }
+
+    pub fn worldToLoc(pos: Point3<f32>) -> (Point3<i32>, ChunkPos) {
+        let s = CHUNKSIZE as i32;
+
+        // 1) go from world-space floats to integer block coords with floor semantics
+        let wx = pos.x.floor() as i32;
+        let wy = pos.y.floor() as i32;
+        let wz = pos.z.floor() as i32;
+
+        // 2) Euclidean chunk coords (work for negatives too)
+        let cx = wx.div_euclid(s);
+        let cz = wz.div_euclid(s);
+
+        // 3) Non-negative local coords in [0, s)
+        let lx = wx.rem_euclid(s);
+        let lz = wz.rem_euclid(s);
+
+        (Point3::new(lx, wy, lz), ChunkPos { x: cx, z: cz })
+    }
 
     pub fn getBlockType(&self, pos: ChunkPos, blockPos: Point3<usize>) -> BlockId {
         match self.chunks.get(&pos) {
-            Some(chunk) => {chunk.blocks[blockPos.x][blockPos.y][blockPos.z]},
-            None => {BlockId::Air}
+            Some(chunk) => chunk.blocks[blockPos.x][blockPos.y][blockPos.z],
+            None => BlockId::Air,
         }
-
     }
 }
 
